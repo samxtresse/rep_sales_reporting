@@ -1,147 +1,400 @@
-# Xtressé Rep Tracker — standalone Vercel app
+// lib/repData.js
+// Single Windsor.ai pull (Shopify line items, Jan 2025 onward) → cached 4hr →
+// produces three aggregations per rep:
+//
+//   monthly[]   — per-month × per-product × FT/Ret aggregates (existing)
+//   accounts[]  — one row per unique customer in the rep's territory
+//   orders[]    — per-order rollups (line items grouped) for drill-down
+//
+// All three are filtered to the rep slug before the dashboard ever sees them.
 
-Internal-only sales tracker for Xtressé reps. **Completely separate** from the
-leadership dashboard. Reps go to one URL, type their last name as the
-password, see only their own data.
+import { unstable_cache } from 'next/cache';
+import { matchRepFromTags } from './repRoster.js';
 
-## What reps see
+const GUMMY_SKUS  = new Set(['860011740100', 'XTRS001']);
+const XVIE_SKUS   = new Set(['X-XVIE-2ML-006']);
+const SERUM_SKUS  = new Set(['X-FRC-30ML-CASE', 'X-FRC-30ML-001']);
+const SACHET_SKUS = new Set(['X-GN-002CT-001', 'X-GN-002CT-002', 'X-GN-002CT-003', 'X-GN-002CT-004']);
+const EXCLUDE_SKUS = new Set(['XTR-SHPR-DBL', 'X-GN-002CT-RAW']);
 
-- **Login** — single password input. Type your last name (lowercase). The
-  app figures out who you are.
-- **Dashboard** — your name and territory at the top. Below that:
-  - Year selector + month pills (click to toggle, Jan 2025 onward as data exists)
-  - 5 KPI tiles: Total net sales, First-time biz %, Total accounts, AOV, Estimated commission
-  - Sales by product table (Gummies / XVIE / Serum / Sachets) with FT/Returning split per month
-  - New accounts by product
-  - Commission tier card with live formula breakdown
-  - Projected sales input → projected commission output
-  - **Account history** — every account in your territory with last-order date, lifetime $, current-quarter loyalty tier (sortable, searchable)
-  - **Recent orders** — last 50 B2B orders with date, account, product mix, total
-- **Sign out** button in the top right
+function classifyBySku(sku, title) {
+  if (!sku) {
+    const t = (title || '').toLowerCase();
+    if (t.includes('sachet') && !t.includes('gummy on the go')) return 'sa';
+    if (t.includes('gummy on the go')) return 'sa';
+    if (t.includes('xvie')) return 'xv';
+    if (t.includes('serum')) return 'se';
+    if (t.includes('gummy') || t.includes('gummies')) return 'gum';
+    return null;
+  }
+  if (EXCLUDE_SKUS.has(sku)) return null;
+  if (GUMMY_SKUS.has(sku))   return 'gum';
+  if (XVIE_SKUS.has(sku))    return 'xv';
+  if (SERUM_SKUS.has(sku))   return 'se';
+  if (SACHET_SKUS.has(sku))  return 'sa';
+  if (sku.startsWith('X-GN-002CT')) return 'sa';
+  const u = sku.toUpperCase();
+  if (u.includes('XVIE')) return 'xv';
+  if (u.includes('FRC'))  return 'se';
+  return null;
+}
 
-A rep cannot see any other rep's data, the leadership dashboard, or anything
-about Xtressé's internal financials. The only data that hits their browser is
-filtered to their tagged orders by the server before rendering.
+const PRODUCT_LABEL = { gum: 'Gummies', xv: 'XVIE', se: 'Serum', sa: 'Sachets' };
+const B2B_THRESHOLD = 700;
 
-## Architecture
+// ---- Loyalty tier from quarterly gummy case quantity ----
+// 1 case = Silver, 2-3 = Gold, 4-5 = Platinum, 6+ = Diamond. National = None.
+function loyaltyTier(caseQty) {
+  if (!caseQty || caseQty < 1) return null;
+  if (caseQty === 1) return 'Silver';
+  if (caseQty <= 3) return 'Gold';
+  if (caseQty <= 5) return 'Platinum';
+  return 'Diamond';
+}
 
-| Route | Auth | Notes |
-|---|---|---|
-| `/` | public | Login form. Auto-redirects to `/dashboard` if signed in. |
-| `/api/login` | public | POST `{ password }`. Matches against all reps. Sets `rep_session` cookie with the matching slug. |
-| `/api/logout` | public | POST. Clears the cookie. |
-| `/dashboard` | gated | Reads cookie → resolves rep → fetches data → renders. |
+// ---- Windsor.ai fetch ----
 
-No middleware. All auth happens at the page level via `cookies()` from
-`next/headers`. There's no edge function for Vercel to bundle, so the
-`next/server` error you saw on the leadership dash can't recur here.
+async function windsorFetch(fields, dateFrom, dateTo) {
+  const apiKey = process.env.WINDSOR_API_KEY;
+  if (!apiKey) throw new Error('Missing WINDSOR_API_KEY env var');
+  const account = process.env.WINDSOR_ACCOUNT || 'ace1d0-26.myshopify.com';
 
-Data pulls live from Windsor.ai → Shopify on each request, cached for 4
-hours via `unstable_cache`.
+  const params = new URLSearchParams();
+  params.set('api_key', apiKey);
+  params.set('connector', 'shopify');
+  params.set('account', account);
+  params.set('fields', fields.join(','));
+  params.set('date_from', dateFrom);
+  params.set('date_to', dateTo);
+  params.set('date_filters', JSON.stringify({ orders: 'createdAt' }));
 
-## Passwords (auto-derived from last name)
+  const url = 'https://api.windsor.ai/connectors/shopify?' + params.toString();
+  const res = await fetch(url, { method: 'GET' });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`Windsor.ai fetch failed: ${res.status} ${txt.slice(0, 300)}`);
+  }
+  const json = await res.json();
+  return json.data || json.rows || [];
+}
 
-| Rep | Password |
-|---|---|
-| Jamie Bergeron | bergeron |
-| Michelle Spencer | spencer |
-| Dia Lamport | lamport |
-| Cheryl Greiber | greiber |
-| Denisse Schimelpfening | schimelpfening |
-| Laura Mann | mann |
-| Sherry Quinn | quinn |
-| Tyler De Masi | demasi |
-| Michelle Boehle | boehle |
-| Sonia Mace | mace |
-| Taylor Bates | bates |
-| Heidi Fisher | fisher |
-| Amy Pierre | pierre |
-| Gina Napoli | napoli |
-| Megan Gilbert | gilbert |
-| Bridget Selberg | selberg |
-| Carrie Dodge | dodge |
-| Morgan Hood | hood |
-| James Tuckett | tuckett |
+function ymOf(s) {
+  if (!s) return null;
+  const d = String(s).slice(0, 10);
+  const [y, m] = d.split('-').map(Number);
+  if (!y || !m) return null;
+  return { y, m };
+}
 
-Comparison is case-insensitive. To override any rep, set `REP_PASS_<SLUG>` in
-Vercel env vars (e.g. `REP_PASS_AMY_PIERRE=somethingelse`).
+function lineRevenue(r) {
+  const price = Number(r.line_item__price || 0);
+  const qty   = Number(r.line_item__quantity || 0);
+  const disc  = Number(r.line_item__total_discount || 0);
+  return price * qty - disc;
+}
 
-## Deploy
+function pickFirst(...vals) {
+  for (const v of vals) {
+    if (v != null && String(v).trim() !== '') return String(v).trim();
+  }
+  return '';
+}
 
-This is a **brand-new Vercel project**, not an addition to an existing one.
+// ---- Build all derivations from a single Windsor pull ----
 
-### Option A — GitHub + Vercel dashboard (recommended)
+async function buildAllRepData() {
+  // Try a generous field list. Windsor returns nulls for fields not exposed
+  // by the connector — `pickFirst` collapses fallbacks gracefully.
+  const fields = [
+    'order_id',
+    'order_name',
+    'order_created_at',
+    'order_total_price',
+    'order_tags',
+    'order_customer_id',
+    'order_email',
+    'order_shipping_company',
+    'order_shipping_address__company',
+    'order_billing_company',
+    'order_billing_address__company',
+    'order_shipping_city',
+    'order_shipping_address__city',
+    'order_shipping_province',
+    'order_shipping_province_code',
+    'order_shipping_address__province',
+    'line_item__sku',
+    'line_item__title',
+    'line_item__price',
+    'line_item__quantity',
+    'line_item__total_discount',
+  ];
 
-1. **Create a new GitHub repo** (e.g. `xtresse-rep-tracker`).
-2. **Upload all the files** from this folder (drag-and-drop the contents
-   into the GitHub repo's "Add file → Upload files" — or push from your
-   machine if you have git installed).
-3. **Go to https://vercel.com/new** → click **Import** next to the new repo.
-4. **Add the two env vars** when prompted (or in Settings → Environment
-   Variables after the first deploy):
-   - `WINDSOR_API_KEY` — your Windsor.ai API key
-   - `WINDSOR_ACCOUNT` — your Shopify connector slug (e.g. `ace1d0-26.myshopify.com`)
-   Mark each one for **Production, Preview, AND Development**.
-5. Click **Deploy**. Vercel builds and gives you a URL like
-   `xtresse-rep-tracker.vercel.app` in ~60 seconds.
+  // History from Jan 2024 onward — gives us the first-purchase signal needed
+  // to classify FT vs Returning correctly. The dashboard's year selector
+  // will surface 2025 onward as soon as data exists.
+  const today = new Date().toISOString().slice(0, 10);
+  const all = await windsorFetch(fields, '2024-01-01', today);
 
-### Option B — Vercel CLI (if you already have Node installed)
+  // ---- Pass 1: first-purchase date per customer per category (full history) ----
+  const firstDate = new Map();
+  for (const r of all) {
+    const cust = String(r.order_customer_id || (r.order_email || '').toLowerCase());
+    if (!cust || cust === 'none') continue;
+    const date = String(r.order_created_at || '').slice(0, 10);
+    if (!date) continue;
+    const cat = classifyBySku(r.line_item__sku, r.line_item__title);
+    if (!cat) continue;
+    if (!firstDate.has(cust)) firstDate.set(cust, {});
+    const obj = firstDate.get(cust);
+    if (!obj[cat] || date < obj[cat]) obj[cat] = date;
+  }
 
-```bash
-# In the unzipped folder:
-npm install
-npx vercel
-# Walk through the prompts (accept defaults). After the first deploy,
-# go to Project Settings → Environment Variables and add WINDSOR_API_KEY
-# and WINDSOR_ACCOUNT, then redeploy:
-npx vercel --prod
-```
+  // ---- Pass 2: aggregate per rep ----
+  // Three structures keyed by rep slug:
+  //   monthlyByRep[slug]  → Map<'YYYY-MM', monthlyRow>
+  //   acctsByRep[slug]    → Map<custKey, accountRow>
+  //   ordersByRep[slug]   → Map<orderId, orderRow>
+  const monthlyByRep = new Map();
+  const acctsByRep = new Map();
+  const ordersByRep = new Map();
 
-### Custom domain (optional)
+  function emptyMonthly(slug, y, m) {
+    return {
+      repSlug: slug, year: y, month: m,
+      gum_ft: 0, gum_ret: 0, gum_ft_n: 0, gum_ret_n: 0,
+      xv_ft:  0, xv_ret:  0, xv_ft_n:  0, xv_ret_n:  0,
+      se_ft:  0, se_ret:  0, se_ft_n:  0, se_ret_n:  0,
+      sa_ft:  0, sa_ret:  0, sa_ft_n:  0, sa_ret_n:  0,
+      _ft_custs: { gum: new Set(), xv: new Set(), se: new Set(), sa: new Set() },
+      _ret_custs:{ gum: new Set(), xv: new Set(), se: new Set(), sa: new Set() },
+    };
+  }
+  function getMonthly(slug, y, m) {
+    if (!monthlyByRep.has(slug)) monthlyByRep.set(slug, new Map());
+    const sub = monthlyByRep.get(slug);
+    const k = `${y}-${String(m).padStart(2, '0')}`;
+    if (!sub.has(k)) sub.set(k, emptyMonthly(slug, y, m));
+    return sub.get(k);
+  }
+  function getAccount(slug, custKey) {
+    if (!acctsByRep.has(slug)) acctsByRep.set(slug, new Map());
+    const sub = acctsByRep.get(slug);
+    if (!sub.has(custKey)) {
+      sub.set(custKey, {
+        customerId: custKey,
+        companyName: '',
+        city: '',
+        state: '',
+        firstOrderDate: '',
+        lastOrderDate: '',
+        orderCount: 0,
+        orderIds: new Set(),
+        totalRevenue: 0,
+        productMix: { gum: 0, xv: 0, se: 0, sa: 0 },
+        gumCasesQuarter: 0, // for loyalty tier — counted within current quarter in postprocess
+      });
+    }
+    return sub.get(custKey);
+  }
+  function getOrder(slug, orderId) {
+    if (!ordersByRep.has(slug)) ordersByRep.set(slug, new Map());
+    const sub = ordersByRep.get(slug);
+    if (!sub.has(orderId)) {
+      sub.set(orderId, {
+        orderId,
+        orderName: '',
+        date: '',
+        customerId: '',
+        companyName: '',
+        city: '',
+        state: '',
+        total: 0,
+        products: { gum: 0, xv: 0, se: 0, sa: 0 },
+        productLabels: new Set(),
+        gumQty: 0,
+        xvQty: 0,
+        seQty: 0,
+        saQty: 0,
+        firstTimeAny: false,
+      });
+    }
+    return sub.get(orderId);
+  }
 
-Vercel project Settings → Domains → add (e.g.) `tracker.xtresse.com`. Free.
-Send that link to your reps.
+  for (const r of all) {
+    const orderTotal = Number(r.order_total_price || 0);
+    if (orderTotal < B2B_THRESHOLD) continue;
+    const slug = matchRepFromTags(r.order_tags);
+    if (!slug || slug === '__EXCLUDE__') continue;
 
-## Env vars
+    const cat = classifyBySku(r.line_item__sku, r.line_item__title);
+    if (!cat) continue;
 
-Two required:
+    const ym = ymOf(r.order_created_at);
+    if (!ym) continue;
 
-| Var | Value | Notes |
-|---|---|---|
-| `WINDSOR_API_KEY` | from Windsor.ai dashboard | Settings → API Keys at https://onboard.windsor.ai/ |
-| `WINDSOR_ACCOUNT` | your shop slug | Same value as your leadership dashboard uses |
+    const dateStr = String(r.order_created_at || '').slice(0, 10);
+    const ymKey = `${ym.y}-${String(ym.m).padStart(2, '0')}`;
+    const cust = String(r.order_customer_id || (r.order_email || '').toLowerCase());
+    const fd = firstDate.get(cust)?.[cat];
+    const rev = lineRevenue(r);
+    const qty = Number(r.line_item__quantity || 0);
+    const isFT = fd && fd.slice(0, 7) === ymKey;
 
-Optional:
+    // monthly
+    const row = getMonthly(slug, ym.y, ym.m);
+    if (isFT) { row[`${cat}_ft`] += rev; row._ft_custs[cat].add(cust); }
+    else      { row[`${cat}_ret`] += rev; row._ret_custs[cat].add(cust); }
 
-| Var | What it does |
-|---|---|
-| `REP_PASS_<SLUG>` | Override one rep's password (e.g. `REP_PASS_AMY_PIERRE=newpass123`) |
-| `REP_PASSWORDS` | JSON map override for multiple reps at once: `{"amy-pierre":"x","jamie-bergeron":"y"}` |
+    // account
+    const a = getAccount(slug, cust);
+    a.totalRevenue += rev;
+    a.productMix[cat] += rev;
+    if (!a.firstOrderDate || dateStr < a.firstOrderDate) a.firstOrderDate = dateStr;
+    if (!a.lastOrderDate  || dateStr > a.lastOrderDate)  a.lastOrderDate  = dateStr;
+    a.orderIds.add(r.order_id);
+    if (!a.companyName) {
+      a.companyName = pickFirst(
+        r.order_shipping_company,
+        r.order_shipping_address__company,
+        r.order_billing_company,
+        r.order_billing_address__company,
+        r.order_email
+      );
+    }
+    if (!a.city)  a.city  = pickFirst(r.order_shipping_city, r.order_shipping_address__city);
+    if (!a.state) a.state = pickFirst(r.order_shipping_province_code, r.order_shipping_province, r.order_shipping_address__province);
 
-## Local development
+    // order
+    const o = getOrder(slug, r.order_id);
+    o.date = o.date && o.date < dateStr ? o.date : dateStr;
+    o.orderName = r.order_name || o.orderName;
+    o.customerId = cust;
+    o.total += rev;
+    o.products[cat] += rev;
+    if (cat === 'gum') o.gumQty += qty;
+    if (cat === 'xv') o.xvQty += qty;
+    if (cat === 'se') o.seQty += qty;
+    if (cat === 'sa') o.saQty += qty;
+    o.productLabels.add(PRODUCT_LABEL[cat]);
+    if (isFT) o.firstTimeAny = true;
+    if (!o.companyName) {
+      o.companyName = pickFirst(
+        r.order_shipping_company,
+        r.order_shipping_address__company,
+        r.order_billing_company,
+        r.order_billing_address__company,
+        r.order_email
+      );
+    }
+    if (!o.city)  o.city  = pickFirst(r.order_shipping_city, r.order_shipping_address__city);
+    if (!o.state) o.state = pickFirst(r.order_shipping_province_code, r.order_shipping_province, r.order_shipping_address__province);
+  }
 
-```bash
-cp .env.example .env.local
-# edit .env.local and put real values in
-npm install
-npm run dev
-```
+  // ---- Finalize: counts, loyalty, sort ----
+  const monthlyOut = [];
+  for (const [slug, sub] of monthlyByRep) {
+    for (const [, row] of sub) {
+      for (const c of ['gum','xv','se','sa']) {
+        row[`${c}_ft_n`]  = row._ft_custs[c].size;
+        row[`${c}_ret_n`] = row._ret_custs[c].size;
+      }
+      delete row._ft_custs;
+      delete row._ret_custs;
+      monthlyOut.push(row);
+    }
+  }
 
-Open http://localhost:3000.
+  // accounts: convert orderIds Set → count, attach loyalty tier
+  const accountsOut = [];
+  for (const [slug, sub] of acctsByRep) {
+    for (const [, a] of sub) {
+      a.orderCount = a.orderIds.size;
+      delete a.orderIds;
+      a.repSlug = slug;
+      // Loyalty tier from current-quarter gummy cases.
+      // We approximate by counting unique gummy-orders in the most recent
+      // quarter present in their data — same shape as the workbook.
+      // (Detailed quarterly tier is computed at render time from monthly rows.)
+      accountsOut.push(a);
+    }
+  }
 
-## Updating
+  const ordersOut = [];
+  for (const [slug, sub] of ordersByRep) {
+    for (const [, o] of sub) {
+      o.repSlug = slug;
+      o.productLabels = Array.from(o.productLabels);
+      ordersOut.push(o);
+    }
+  }
 
-- **New rep** → add a row to `lib/repRoster.js`, push, redeploy.
-- **New comp plan quarter** → add to `lib/compPlan.js`, update `planKey` in
-  `lib/repRoster.js` if needed.
-- **SKU classification change** → `lib/repData.js`, top of file.
+  return { monthly: monthlyOut, accounts: accountsOut, orders: ordersOut };
+}
 
-## Caveats
+export const getAllRepData = unstable_cache(
+  buildAllRepData,
+  ['rep-detail-v1'],
+  { revalidate: 14400, tags: ['rep-detail'] }
+);
 
-- ADCS-tagged orders excluded throughout.
-- XVIE / Serum sit on plans not yet wired in — revenue is shown but doesn't
-  roll into commission until those tier tables are added to `lib/compPlan.js`.
-- Account company names, cities, and states pull from Shopify shipping
-  fields. If a few accounts show blanks, those orders had no shipping
-  company set in Shopify.
-- Cache is per-deployment. Force a refresh by redeploying in Vercel.
+// ---------- per-rep slices ----------
+
+export async function getRepMonthlyData(slug) {
+  if (!slug) return [];
+  const { monthly } = await getAllRepData();
+  return monthly
+    .filter(r => r.repSlug === slug)
+    .sort((a, b) => (a.year - b.year) || (a.month - b.month));
+}
+
+// Account-level rollup for one rep, with loyalty tier inferred from gummy
+// cases in the most recent calendar quarter.
+export async function getRepAccountData(slug) {
+  if (!slug) return [];
+  const { accounts, orders } = await getAllRepData();
+  const accts = accounts.filter(a => a.repSlug === slug);
+
+  // Compute current-quarter gummy case count per customer for loyalty tier.
+  // Uses the most recent quarter that exists in their order history.
+  const today = new Date();
+  const curY = today.getUTCFullYear();
+  const curQ = Math.ceil((today.getUTCMonth() + 1) / 3);
+  const qStart = new Date(Date.UTC(curY, (curQ - 1) * 3, 1)).toISOString().slice(0, 10);
+
+  const gumCasesByCustQ = new Map();
+  for (const o of orders) {
+    if (o.repSlug !== slug) continue;
+    if (!o.date || o.date < qStart) continue;
+    if (!o.gumQty) continue;
+    gumCasesByCustQ.set(o.customerId, (gumCasesByCustQ.get(o.customerId) || 0) + o.gumQty);
+  }
+
+  return accts
+    .map(a => ({
+      ...a,
+      gumCasesQuarter: gumCasesByCustQ.get(a.customerId) || 0,
+      loyaltyTier: loyaltyTier(gumCasesByCustQ.get(a.customerId) || 0),
+    }))
+    .sort((a, b) => (b.lastOrderDate || '').localeCompare(a.lastOrderDate || ''));
+}
+
+// Last N B2B orders for a rep, newest first.
+export async function getRepRecentOrders(slug, limit = 50) {
+  if (!slug) return [];
+  const { orders } = await getAllRepData();
+  return orders
+    .filter(o => o.repSlug === slug)
+    .sort((a, b) => (b.date || '').localeCompare(a.date || ''))
+    .slice(0, limit);
+}
+
+// Convenience: get everything one rep needs in a single call.
+export async function getRepBundle(slug) {
+  const [monthly, accounts, orders] = await Promise.all([
+    getRepMonthlyData(slug),
+    getRepAccountData(slug),
+    getRepRecentOrders(slug, 50),
+  ]);
+  return { monthly, accounts, orders };
+}
